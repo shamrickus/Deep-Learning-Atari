@@ -1,0 +1,3 @@
+[submodule "ALE"]
+	path = ALE
+	url = https://github.com/mgbellemare/Arcade-Learning-Environment
