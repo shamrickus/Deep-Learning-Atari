@@ -20,8 +20,7 @@ class ALEPlayer:
         self.romName = romName
         self.ale = ale
         self.actions = self.ale.getLegalActionSet()
-        #noop last
-        self.actions = numpy.roll(self.actions, -1)
+        #self.actions = numpy.roll(self.actions, -1)
         self.originalState = self.ale.cloneSystemState()
 
     def mapAction(self, action):
