@@ -1,194 +1,129 @@
-import json
-import math
 import os
-import sys
 import time
-from json import JSONEncoder
-from random import randrange
-from statistics import mean
+import random
 
-import pydotplus
-import jsonpickle
-from ale_python_interface import ALEInterface
-
+import BaseROM
 from ALEPlayer import ALEPlayer
-
-class Node:
-    terminal = False
-    visits = 0
-    depth = 0
-    totalReward = 0
-    children = None
-    state = None
-    parent = None
-    selectWeight = 0
-
-    def __init__(self, actionSet, depth, parent=None, action=None):
-        self.children = dict()
-        for action in actionSet:
-            self.children[action] = None
-        self.depth = depth
-        if parent:
-            self.parent = parent
-        self.action = action
-
-    def __str__(self):
-        return "state: {}, depth: {}, reward: {}, visits: {}, weight: {}".format(self.state, self.depth, self.totalReward,
-                                                                     self.visits, self.selectWeight)
-
-    def expand(self):
-        for k in self.children.keys():
-            if self.children[k] is None:
-                self.children[k] = Node(self.children.keys(), self.depth + 1, self, k)
-
-    def simulate(self, ale: ALEInterface, depthLimit):
-        self.visits += 1
-        depth = 0
-        self.state = ale.cloneState()
-        self.terminal = ale.game_over()
-        actionSet = ale.getLegalActionSet()
-        while not ale.game_over():
-            if depth > depthLimit:
-                break
-            action = self.selectRandomAction(actionSet)
-            reward = ale.act(action)
-            self.totalReward += reward*100
-            depth += 1
-        ale.restoreState(self.state)
-        return self.totalReward
-        # print(self)
-        # print("took: {}".format(time.time() - timer))
-
-    def backPropagate(self, score):
-        if self.parent:
-            self.parent.update(score)
-
-    def calculateWeight(self):
-        if self.parent and self.visits > 0:
-            try:
-                self.selectWeight = self.totalReward / self.visits + .01*(math.log(self.parent.visits)/self.visits)**(1/2)
-            except ValueError:
-                pass
-            except ZeroDivisionError:
-                print("asdf")
-        return self.selectWeight
-
-    def update(self, reward):
-        self.visits += 1
-        self.totalReward += reward
-        self.backPropagate(reward)
-
-    def isLeaf(self):
-        return self.visits == 0 and self.state == None
-
-    def selectRandomAction(self, actions):
-        return actions[randrange(len(actions))]
-
-    def selectBestChild(self):
-        children = sorted([x for x in list(self.children.values()) if x is not None and not x.terminal], reverse=True, key=lambda x: x.calculateWeight())
-        if len(children) == 0:
-            return None
-        children = [x for x in children if x.selectWeight == children[0].selectWeight]
-        return children[randrange(len(children))]
-
-    def select(self, maxDepth):
-        if self.isLeaf():
-            return self
-        elif self.terminal:
-            print("lel")
-        #elif self.depth >= maxDepth:
-        #    return None
-        else:
-            for k in self.children.keys():
-                if self.children[k] is None:
-                    self.children[k] = Node(self.children.keys(), self.depth + 1, self, k)
-                if self.children[k].isLeaf():
-                    return self.children[k]
-            return self.selectBestChild().select(maxDepth)
+from Node import Node
+from NN import NN, HybridNN, ClassificationNN, RegressionNN
 
 
 class MarkovDecisionProcess(ALEPlayer):
-    immediateGameover = None
     rootNode: Node = None
     maxTrajectories = 10000
     maxDepth = 300
-    exploration = 1
+    runs = 40
+    models = []
+    squeeze_ram = False
 
-    def __init__(self, rowName, ale):
-        super().__init__(rowName, ale)
-        self.rootNode = Node(self.actions, 0)
+    def __init__(self, rom: BaseROM, squeeze_ram=False):
+        super().__init__(rom)
+        self.ale.act(0)
+        self.rootNode = Node(self.actions, 0, self.ale)
+        self.models = [RegressionNN(rom), ClassificationNN(rom), HybridNN(rom)]
+        self.squeeze_ram = squeeze_ram
 
-
-    def fileName(self):
-        return "{}.{}".format(self.romName, self.ale.getInt(b'random_seed')) + '.json'
-
-    def preRun(self, outfile=False):
+    def solve(self):
         self.rootNode.expand()
         trajectory = 0
-        depth = self.rootNode.depth + 1
         t2 = time.time()
         t = time.time()
-        maxDepth = 0
         while trajectory < self.maxTrajectories:
-            nodeToRun = self.rootNode.select(depth)
+            nodeToRun = self.rootNode.select()
             nodeToRun.expand()
-            score = nodeToRun.simulate(self.ale, self.maxDepth)
-            nodeToRun.backPropagate(score)
+            score = nodeToRun.simulate(self.ale, self.maxDepth, self.rom)
+            nodeToRun.back_propagate(score)
             trajectory += 1
-            if nodeToRun.depth > maxDepth:
-                maxDepth = nodeToRun.depth
             if trajectory % 100 == 0:
-                print("total: {0:.3g}s, {1:.3g}s, {2:.3g}%".format(time.time() - t2, time.time() - t, trajectory / self.maxTrajectories * 100))
-                print(maxDepth)
+                print("total: {0:.5g}s, {1:.3g}s, {2:.3g}%".format(time.time() - t2, time.time() - t,
+                                                                   trajectory / self.maxTrajectories * 100))
                 t = time.time()
-        if outfile:
-            with open(self.fileName(), 'w') as f:
-                f.write("{},{}{}".format(self.maxTrajectories, self.maxDepth, os.linesep))
-                f.write(jsonpickle.encode(self.rootNode))
-            if self.maxTrajectories <= 500:
-                print("Writing to file")
-                self.toGraphviz()
-        print("done {}, max depth: {}".format(time.time() - t2, maxDepth))
+        print("done {}".format(time.time() - t2))
 
+    def run_uct(self):
+        node = self.rootNode
+        actionsRan = []
+        switch = False
+        frame = 0
+        reward = 0
+        while not self.ale.game_over():
+            child = node.selectBestChild()
+            if child is None:
+                if not switch:
+                    print("Switching to random on frame: {}, score at this point: {}".format(frame, reward))
+                    switch = True
+                action = node.selectRandomAction()
+            else:
+                action = child.action
+                node = child
+            actionsRan.append(int(action))
+            reward += self.ale.act(action)
+            frame += 1
+
+    def save(self):
+        with open("out/{}.mdp".format(self.rom.name), 'w') as f:
+            f.write("{},{},{}{}".format(self.maxTrajectories, self.maxDepth, self.runs, os.linesep))
+            f.write(self.rootNode.out())
+        if self.maxTrajectories <= 500:
+            print("Writing to file")
+            self.toGraphviz()
+
+    def load(self):
+        if os.path.exists("out/{}.mdp".format(self.rom.name)):
+            with open("out/{}.mdp".format(self.rom.name), 'w') as f:
+                self.rootNode.load(f.readlines()[1:])
+            return True
+        return False
+
+    # @profile
     def run(self):
-        #if os.path.isfile(self.fileName()):
-        #    with open(self.fileName(), 'r') as f:
-        #        self.rootNode = jsonpickle.decode(f.readlines()[1])
-        #else:
-        rewards = []
-        for i in range(0, 1):
-            self.ale.reset_game()
-            self.preRun(True)
-            self.ale.restoreState(self.rootNode.state)
-            node = self.rootNode
-            actions = self.ale.getLegalActionSet()
+        for i in range(0, self.runs):
+            print("---------------------RUN: {}".format(i))
+            self.ale.reset()
+            self.solve()
+
+    def train(self):
+        for network in self.models:
+            if not network.load_model():
+                network.build_model()
+                network.build_data_from_root(self.rootNode)
+                network.split_data()
+                network.train()
+                l, a = network.test()
+                network.save_model()
+                print(f"Training on {network.name()}, loss: {l}, accuracy: {a}")
+            else:
+                print(f"Loaded model {network.name()}")
+
+    def simulate(self):
+        self.ale.set_display(True)
+        self.ale.set_seed(random.randint(1, 99999))
+        for network in self.models:
+            self.ale.set_recording(f"{self.rom.name.split('.')[0]}/{network.name()}")
+            self.ale.load_rom(self.rom)
+            self.ale.act(1)
+
+            lastFrames = [self.rom.process_image(self.ale.get_frame())]
+            lastFrames.append(lastFrames[0])
+            lastFrames.append(lastFrames[0])
+            lastFrames.append(lastFrames[0])
             reward = 0
-            i = 0
-            actionsRan = []
             while not self.ale.game_over():
-                child = node.selectBestChild()
-                if child is None:
-                    action = node.selectRandomAction(actions)
-                else:
-                    i+= 1
-                    action = child.action
-                    node = child
-                print(action)
-                actionsRan.append(action)
-                reward +=self.ale.act(action)
-            print(i)
-            print(jsonpickle.encode(actionsRan))
-            print(reward)
-            rewards.append(reward)
-        print(mean(rewards))
-        print(max(rewards))
-        print(sum(rewards)/len(rewards))
+                action = network.predict(lastFrames).argmax()
+                if random.random() < .1:
+                    action = random.randrange(0, 5)
+                reward += self.ale.act(action)
+                lastFrames.append(self.rom.process_image(self.ale.get_frame()))
+                lastFrames = lastFrames[1:]
+            print(f"Reward for network {network.name()}: {reward}")
 
     def makeGraphizNode(self, node):
+        import pydotplus
         return pydotplus.Node(name="{}".format(node.state), shape='box', style='rounded',
-                           label="{}/{}".format(node.totalReward, node.visits))
+                              label="{}/{}".format(node.totalReward, node.visits))
 
     def drawNode(self, parent, node):
+        import pydotplus
         if node.isLeaf():
             return
         graph = pydotplus.Subgraph()
@@ -201,29 +136,9 @@ class MarkovDecisionProcess(ALEPlayer):
         return graph
 
     def toGraphviz(self):
+        import pydotplus
         graph = pydotplus.Dot()
         o = self.makeGraphizNode(self.rootNode)
         graph.add_node(o)
         graph.add_subgraph(self.drawNode(o, self.rootNode))
-        graph.write("out.{}.png".format(self.ale.getInt(b'random_seed')), format="png")
-
-    def act(self):
-        newState = self.ale.cloneSystemState()
-        bestReward = -1
-        acts = dict()
-        for action in self.actions:
-            self.ale.restoreSystemState(newState)
-            if action in acts and acts[action]:
-                continue
-            mdp = MarkovDecisionProcess(self.romName, self.ale)
-            mdp.copy(self)
-            mdp.runClone(action)
-            acts[action] = mdp.immediateGameover
-            if mdp.reward > bestReward:
-                bestReward = mdp.reward
-
-        if len(set(acts.values())) == 1 and list(acts.values())[0]:
-            self.immediateGameover = True
-        self.reward += bestReward
-        if self.reward > 0:
-            print("yo");
+        graph.write("out.png", format="png")

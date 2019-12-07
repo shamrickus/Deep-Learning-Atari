@@ -1,3 +1,6 @@
 numpy
-tensorflow
+tensorflow==2.0.0b1
 pydotplus
+scikit-image
+sklearn
+jsonpickle
